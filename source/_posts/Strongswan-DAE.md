@@ -49,56 +49,62 @@ tags:
                     * 如果找到sa，则执行清理下线，发送给RMC_DISCONNECT_ACK报文；否则发送RMC_DISCONNECT_NAK。 打印日志信息的代码与日志匹配。确定是该处逻辑处理DAE
             
             * get_matching_ike_sas(this, radius_message_t *request, client):
-                ``` enumerator = request->create_enumerator(request);
-                    while (enumerator->enumerate(enumerator, &type, &data))
+            ```
+                enumerator = request->create_enumerator(request);
+                while (enumerator->enumerate(enumerator, &type, &data))
+                {
+                    if (type == RAT_USER_NAME && data.len)
                     {
-                        if (type == RAT_USER_NAME && data.len)
-                        {
-                            user = identification_create_from_data(data);
-                            DBG1(DBG_CFG, "received RADIUS DAE %N for %Y from %H",
-                                radius_message_code_names, request->get_code(request),
-                                user, client);
-                            add_matching_ike_sas(ids, user);
-                            user->destroy(user);
-                        }
+                        user = identification_create_from_data(data);
+                        DBG1(DBG_CFG, "received RADIUS DAE %N for %Y from %H",
+                            radius_message_code_names, request->get_code(request),
+                            user, client);
+                        add_matching_ike_sas(ids, user);
+                        user->destroy(user);
                     }
-                ```
+                }
+            ```
+
                 * 第一个关键点，处理dae-request时，仅使用了其中的RAT_USER_NAME数据，没有使用session-id... 结合用户行为，可以推测：
                     * 用户边执行重试拨号、边执行了自理平台的下线操作
 
                 * 检查日志信息，发现有以下信息：
-                    ```
-                    14:16:13 charon: 20[CFG] received RADIUS DAE Disconnect-Request for 1769136.... from 59.110.24.89
-                    14:16:13 charon: 20[CFG] closing 1 IKE_SA matching Disconnect-Request, sending Disconnect-ACK
-                    14:16:13 charon: 26[IKE] destroying IKE_SA in state CONNECTING without notification
-                    ``` 
-                    网关认为是CONNECTING状态的会话，不需要做其他操作，因此不会给radius侧回复Account-END，这一点与Radius的日志信息匹配
+                ```
+                14:16:13 charon: 20[CFG] received RADIUS DAE Disconnect-Request for 1769136xxxx from 59.110.24.89
+                14:16:13 charon: 20[CFG] closing 1 IKE_SA matching Disconnect-Request, sending Disconnect-ACK
+                14:16:13 charon: 26[IKE] destroying IKE_SA in state CONNECTING without notification
+                
+                ```
+
+                网关认为是CONNECTING状态的会话，不需要做其他操作，因此不会给radius侧回复Account-END，这一点与Radius的日志信息匹配
 
                 * 这个DAE使用用户名踢下线，具体会踢哪些会话，是否会全踢，还是只踢第一个：
-                    ```
-                    ids = get_matching_ike_sas(this, request, client);
+                ```
+                ids = get_matching_ike_sas(this, request, client);
 
-                    if (ids->get_count(ids))
+                if (ids->get_count(ids))
+                {
+                    DBG1(DBG_CFG, "closing %d IKE_SA%s matching %N, sending %N",
+                        ids->get_count(ids), ids->get_count(ids) > 1 ? "s" : "",
+                        radius_message_code_names, RMC_DISCONNECT_REQUEST,
+                        radius_message_code_names, RMC_DISCONNECT_ACK);
+
+                    enumerator = ids->create_enumerator(ids);
+                    while (enumerator->enumerate(enumerator, &id))
                     {
-                        DBG1(DBG_CFG, "closing %d IKE_SA%s matching %N, sending %N",
-                            ids->get_count(ids), ids->get_count(ids) > 1 ? "s" : "",
-                            radius_message_code_names, RMC_DISCONNECT_REQUEST,
-                            radius_message_code_names, RMC_DISCONNECT_ACK);
-
-                        enumerator = ids->create_enumerator(ids);
-                        while (enumerator->enumerate(enumerator, &id))
-                        {
-                            lib->processor->queue_job(lib->processor, (job_t*)
-                                                    delete_ike_sa_job_create(id, TRUE));
-                        }
-                        enumerator->destroy(enumerator);
-
-                        send_response(this, request, RMC_DISCONNECT_ACK, client);
+                        lib->processor->queue_job(lib->processor, (job_t*)
+                                                delete_ike_sa_job_create(id, TRUE));
                     }
-                    else{
-                        ...
-                    }
-                    ```
+                    enumerator->destroy(enumerator);
+
+                    send_response(this, request, RMC_DISCONNECT_ACK, client);
+                }
+                else{
+                    ...
+                }
+
+                ```
+
                     从代码看，get_matching_ike_sas返回的ids，都会执行清理操作。这一点需要注意，后续统一用户存在多个会话时，确实会存在误踢，把用户全部会话都踢掉
 
     * DAE-COA
@@ -204,8 +210,9 @@ tags:
 
                 entry = get_or_create_entry(this, ike_sa->get_id(ike_sa),
                                             ike_sa->get_unique_id(ike_sa));
-
+            
             ```
+
             创建时，实际调用了这些操作(unique会记录到syslog中)：
             ```
             snprintf(entry->sid, sizeof(entry->sid), "%u-%u", this->prefix, unique);
@@ -216,23 +223,25 @@ tags:
             eap_radius_accounting_t *eap_radius_accounting_create()
             {
                 ...
-
                 /* use system time as Session ID prefix */
                 .prefix = (uint32_t)time(NULL),
-
                 ...
             ```
-            
+
             unique_id是个递增的值，每创建一个ike_sa加1：
+
             ```
             ike_sa_t * ike_sa_create(ike_sa_id_t *ike_sa_id, bool initiator,
                     ike_version_t version)
             {
                 private_ike_sa_t *this;
                 static refcount_t unique_id = 0;
-
+                
                 .unique_id = ref_get(&unique_id),
             ```
+
+            自增在这里：
+
             ```
             /**
             * Increase refcount
